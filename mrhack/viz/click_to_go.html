@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>K1 · Click-to-Go</title>
+<style>
+  :root { --bg:#07090d; --panel:#0d1017; --line:#1c2330; --ink:#e8f0ff; --dim:#7c8aa5;
+          --neon:#00ff5a; --amber:#ff8c00; --cyan:#00dcff; --red:#ff4655; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+              font:14px/1.4 ui-monospace,"SF Mono",Menlo,Consolas,monospace; }
+  .wrap { display:flex; gap:14px; padding:14px; height:100%; }
+  @media (max-width:820px){ .wrap{ flex-direction:column; } }
+  .stage { flex:1; min-height:340px; position:relative; background:#05070a;
+           border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  canvas { width:100%; height:100%; display:block; cursor:crosshair; touch-action:none; }
+  .side { width:290px; display:flex; flex-direction:column; gap:12px; }
+  @media (max-width:820px){ .side{ width:auto; } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  h1 { font-size:15px; margin:0 0 2px; letter-spacing:.5px; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:6px; }
+  .row { display:flex; justify-content:space-between; gap:8px; padding:3px 0; }
+  .row b { color:var(--cyan); font-weight:600; }
+  .status { padding:8px 10px; border-radius:8px; font-weight:600; text-align:center; letter-spacing:.4px; }
+  .ok { background:rgba(0,255,90,.12); color:var(--neon); border:1px solid rgba(0,255,90,.4); }
+  .warn { background:rgba(255,140,0,.12); color:var(--amber); border:1px solid rgba(255,140,0,.4); }
+  .bad { background:rgba(255,70,85,.14); color:var(--red); border:1px solid rgba(255,70,85,.5); }
+  button { width:100%; padding:12px; border-radius:9px; border:1px solid var(--line);
+           background:#141a26; color:var(--ink); font:inherit; font-weight:700; cursor:pointer;
+           letter-spacing:.5px; }
+  button.go { background:linear-gradient(180deg,#00c247,#00913a); border-color:#00ff5a; color:#03110a; }
+  button.go:disabled { background:#161b24; color:#4a5468; border-color:var(--line); cursor:not-allowed; filter:none; }
+  button.clear { background:#1a1420; border-color:#3a2230; color:#ffb0bc; }
+  input { width:100%; padding:8px; border-radius:7px; border:1px solid var(--line);
+          background:#05070a; color:var(--ink); font:inherit; }
+  label { font-size:11px; color:var(--dim); display:block; margin:6px 0 3px; }
+  .pill { display:inline-block; padding:2px 7px; border-radius:20px; font-size:11px;
+          background:#141a26; color:var(--dim); border:1px solid var(--line); }
+  .hint { color:var(--dim); font-size:11px; }
+  .flex { display:flex; gap:8px; align-items:center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="stage"><canvas id="c"></canvas></div>
+  <div class="side">
+    <div class="card">
+      <h1>K1 · CLICK-TO-GO</h1>
+      <div class="sub">Click the floor → preview → confirm. The robot plans and walks there.</div>
+      <div id="track" class="status ok">TRACKING OK</div>
+    </div>
+    <div class="card">
+      <div class="row"><span>Robot</span><b id="rpose">—</b></div>
+      <div class="row"><span>Clicked goal</span><b id="gpose">—</b></div>
+      <div class="row"><span>Distance</span><b id="gdist">—</b></div>
+      <div class="row"><span>Goal check</span><b id="gvalid">—</b></div>
+      <div id="gstatus" class="status warn" style="margin-top:8px">CLICK A POINT</div>
+      <button id="go" class="go" disabled>CONFIRM &amp; GO</button>
+      <button id="clr" class="clear" style="margin-top:8px">CLEAR</button>
+      <div class="hint" style="margin-top:8px">Safety: goal must sit inside the tag rectangle and within
+        <span id="capTxt"></span> m of the robot; confirm is disabled while tracking is stale.
+        Keep the physical stop with an operator.</div>
+    </div>
+    <div class="card">
+      <div class="flex" style="justify-content:space-between">
+        <span class="pill" id="mode">MOCK</span>
+        <span class="hint" id="hz">—</span>
+      </div>
+      <label>Projector server (live)</label>
+      <input id="srv" value="http://10.2.4.14:8765" />
+      <div class="flex" style="margin-top:8px">
+        <button id="live" style="flex:1">GO LIVE</button>
+        <button id="mock" style="flex:1">MOCK</button>
+      </div>
+      <div class="hint" style="margin-top:6px">Live posts to <code>/api/navigation/goal</code> and reads
+        <code>/ws/navigation</code>. Serve this page from the projector console for same-origin access.</div>
+    </div>
+  </div>
+</div>
+<script>
+// ---- floor frame (metres): origin at tag-rectangle centre, +X right, +Y up ----
+const RECT = { rx: 1.5, ry: 1.1 };          // walkable half-extents (tag rectangle)
+const TAGS = [[-1.2,-0.9],[1.2,-0.9],[1.2,0.9],[-1.2,0.9]];
+const TAG_SIZE = 0.13, MAX_DIST = 3.0, STALE_MS = 500;
+document.getElementById('capTxt').textContent = MAX_DIST.toFixed(1);
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let PPM = 200, W = 0, H = 0;
+function resize(){ const r = cv.getBoundingClientRect(); cv.width = W = r.width*devicePixelRatio;
+  cv.height = H = r.height*devicePixelRatio; ctx.setTransform(1,0,0,1,0,0);
+  PPM = Math.min(W/(RECT.rx*2.6), H/(RECT.ry*2.6)); }
+new ResizeObserver(resize).observe(cv); resize();
+
+const F2C = (x,y)=>[ W/2 + x*PPM, H/2 - y*PPM ];
+const C2F = (px,py)=>[ (px*devicePixelRatio - W/2)/PPM, (H/2 - py*devicePixelRatio)/PPM ];
+
+// ---- state ----
+let robot = { x:0, y:0, yaw:0, valid:true };
+let path = [];                 // [[x,y],...] current plan (from WS or mock)
+let goal = null;               // {x,y} previewed, not yet confirmed
+let lastMsg = performance.now();
+let live = false, srvBase = '';
+
+function inRect(x,y){ return Math.abs(x) <= RECT.rx && Math.abs(y) <= RECT.ry; }
+function dist(a,b){ return Math.hypot(a.x-b[0], a.y-b[1]); }
+function fresh(){ return robot.valid && (performance.now()-lastMsg) < STALE_MS; }
+
+function validateGoal(g){
+  if(!g) return {ok:false, why:'—'};
+  if(!fresh()) return {ok:false, why:'tracking stale'};
+  if(!inRect(g.x,g.y)) return {ok:false, why:'outside safe zone'};
+  const d = Math.hypot(g.x-robot.x, g.y-robot.y);
+  if(d > MAX_DIST) return {ok:false, why:'too far ('+d.toFixed(1)+'m)'};
+  return {ok:true, why:'ok', d};
+}
+
+// ---- draw ----
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.lineWidth = 1*devicePixelRatio;
+  // grid
+  ctx.strokeStyle = '#10151f';
+  for(let gx=-2;gx<=2;gx+=0.5){ const [a]=F2C(gx,0); ctx.beginPath(); ctx.moveTo(a,0); ctx.lineTo(a,H); ctx.stroke(); }
+  for(let gy=-1.5;gy<=1.5;gy+=0.5){ const [,b]=F2C(0,gy); ctx.beginPath(); ctx.moveTo(0,b); ctx.lineTo(W,b); ctx.stroke(); }
+  // walkable rectangle
+  const c1=F2C(-RECT.rx,-RECT.ry), c2=F2C(RECT.rx,RECT.ry);
+  ctx.strokeStyle = '#2a3550'; ctx.lineWidth = 2*devicePixelRatio;
+  ctx.strokeRect(c1[0], c2[1], c2[0]-c1[0], c1[1]-c2[1]);
+  // tags
+  ctx.fillStyle = '#cfd8ec';
+  for(const [tx,ty] of TAGS){ const p=F2C(tx,ty), s=TAG_SIZE*PPM;
+    ctx.fillRect(p[0]-s/2, p[1]-s/2, s, s); }
+  // current plan
+  if(path.length>1){
+    ctx.strokeStyle = 'rgba(0,255,90,.9)'; ctx.lineWidth = 4*devicePixelRatio;
+    ctx.beginPath(); path.forEach((p,i)=>{ const c=F2C(p[0],p[1]); i?ctx.lineTo(c[0],c[1]):ctx.moveTo(c[0],c[1]); });
+    ctx.stroke();
+    // direction arrows along the path
+    for(let i=0;i<path.length-1;i+=Math.max(1,(path.length/6)|0)) arrow(path[i],path[i+1],'#00ff5a');
+  }
+  // preview
+  if(goal){
+    const v = validateGoal(goal), col = v.ok?'#00dcff':'#ff4655';
+    const r0=F2C(robot.x,robot.y), g0=F2C(goal.x,goal.y);
+    ctx.strokeStyle = col; ctx.setLineDash([8*devicePixelRatio,6*devicePixelRatio]); ctx.lineWidth=2*devicePixelRatio;
+    ctx.beginPath(); ctx.moveTo(r0[0],r0[1]); ctx.lineTo(g0[0],g0[1]); ctx.stroke(); ctx.setLineDash([]);
+    ctx.strokeStyle = col; ctx.lineWidth=3*devicePixelRatio;
+    ctx.beginPath(); ctx.arc(g0[0],g0[1],13*devicePixelRatio,0,7); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(g0[0]-9*devicePixelRatio,g0[1]); ctx.lineTo(g0[0]+9*devicePixelRatio,g0[1]);
+    ctx.moveTo(g0[0],g0[1]-9*devicePixelRatio); ctx.lineTo(g0[0],g0[1]+9*devicePixelRatio); ctx.stroke();
+  }
+  // safety ring + robot
+  const rp=F2C(robot.x,robot.y);
+  ctx.strokeStyle = fresh()?'rgba(0,255,90,.5)':'rgba(255,70,85,.7)'; ctx.lineWidth=2*devicePixelRatio;
+  ctx.beginPath(); ctx.arc(rp[0],rp[1],0.6*PPM,0,7); ctx.stroke();
+  ctx.fillStyle = fresh()?'#00ff5a':'#ff4655';
+  ctx.beginPath(); ctx.arc(rp[0],rp[1],9*devicePixelRatio,0,7); ctx.fill();
+  ctx.strokeStyle = '#ffd200'; ctx.lineWidth=3*devicePixelRatio;
+  ctx.beginPath(); ctx.moveTo(rp[0],rp[1]);
+  ctx.lineTo(rp[0]+Math.cos(-robot.yaw)*22*devicePixelRatio, rp[1]+Math.sin(-robot.yaw)*22*devicePixelRatio); ctx.stroke();
+  requestAnimationFrame(draw);
+}
+function arrow(a,b,col){ const A=F2C(a[0],a[1]),B=F2C(b[0],b[1]);
+  const ang=Math.atan2(B[1]-A[1],B[0]-A[0]), L=9*devicePixelRatio;
+  ctx.strokeStyle=col; ctx.lineWidth=3*devicePixelRatio; ctx.beginPath();
+  ctx.moveTo(B[0],B[1]); ctx.lineTo(B[0]-L*Math.cos(ang-0.4),B[1]-L*Math.sin(ang-0.4));
+  ctx.moveTo(B[0],B[1]); ctx.lineTo(B[0]-L*Math.cos(ang+0.4),B[1]-L*Math.sin(ang+0.4)); ctx.stroke(); }
+requestAnimationFrame(draw);
+
+// ---- HUD ----
+function hud(){
+  document.getElementById('rpose').textContent = robot.x.toFixed(2)+', '+robot.y.toFixed(2)+'  '+(robot.yaw*57.3|0)+'°';
+  const t = document.getElementById('track');
+  if(fresh()){ t.className='status ok'; t.textContent='TRACKING OK'; }
+  else { t.className='status bad'; t.textContent='TRACKING LOST'; }
+  const gEl=document.getElementById('gpose'), dEl=document.getElementById('gdist'),
+        vEl=document.getElementById('gvalid'), sEl=document.getElementById('gstatus'), go=document.getElementById('go');
+  if(!goal){ gEl.textContent='—'; dEl.textContent='—'; vEl.textContent='—';
+    sEl.className='status warn'; sEl.textContent='CLICK A POINT'; go.disabled=true; }
+  else {
+    const v=validateGoal(goal);
+    gEl.textContent=goal.x.toFixed(2)+', '+goal.y.toFixed(2);
+    dEl.textContent=Math.hypot(goal.x-robot.x,goal.y-robot.y).toFixed(2)+' m';
+    vEl.textContent=v.ok?'valid':v.why;
+    if(v.ok){ sEl.className='status ok'; sEl.textContent='READY — CONFIRM TO GO'; go.disabled=false; }
+    else { sEl.className='status bad'; sEl.textContent='BLOCKED: '+v.why.toUpperCase(); go.disabled=true; }
+  }
+  setTimeout(hud,120);
+}
+hud();
+
+// ---- click ----
+cv.addEventListener('pointerdown', e=>{
+  const r=cv.getBoundingClientRect(); const [x,y]=C2F(e.clientX-r.left, e.clientY-r.top);
+  goal = { x:+x.toFixed(3), y:+y.toFixed(3) };
+});
+document.getElementById('clr').onclick = ()=>{ goal=null; };
+
+// ---- confirm & go ----
+document.getElementById('go').onclick = async ()=>{
+  if(!goal || !validateGoal(goal).ok) return;
+  const body = { x:goal.x, y:goal.y, yaw:0, source:'click-console' };
+  if(live){
+    try{
+      await fetch(srvBase+'/api/navigation/goal', {method:'POST',
+        headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+    }catch(err){ alert('POST failed: '+err); return; }
+  } else { mockGo(goal); }
+  goal = null;
+};
+
+// ---- LIVE: websocket + POST ----
+let ws=null;
+function goLive(){
+  srvBase = document.getElementById('srv').value.replace(/\/$/,'');
+  const wsUrl = srvBase.replace(/^http/,'ws') + '/ws/navigation';
+  try{ ws = new WebSocket(wsUrl); }catch(e){ alert('WS failed: '+e); return; }
+  ws.onopen = ()=>{ live=true; stopMock(); document.getElementById('mode').textContent='LIVE';
+                    document.getElementById('mode').style.color='#00ff5a'; };
+  ws.onclose = ()=>{ document.getElementById('hz').textContent='ws closed'; };
+  ws.onerror = ()=>{ alert('WS error — is the projector server reachable / same-origin?'); };
+  ws.onmessage = ev=>{ lastMsg=performance.now();
+    try{ const d=JSON.parse(ev.data); const rp=d.robot_pose;
+      if(rp){ robot={x:+rp.x, y:+rp.y, yaw:+(rp.yaw||0), valid:rp.valid!==false}; }
+      path = (d.trajectory && d.trajectory.waypoints) ? d.trajectory.waypoints : path;
+      document.getElementById('hz').textContent='live '+(d.state_version??'');
+    }catch(e){}
+  };
+}
+document.getElementById('live').onclick = goLive;
+document.getElementById('mock').onclick = ()=>{ if(ws){ws.close(); ws=null;} live=false;
+  document.getElementById('mode').textContent='MOCK'; document.getElementById('mode').style.color='';
+  startMock(); };
+
+// ---- MOCK: fake robot + animated walk-to-goal ----
+let mockT=null, target=null;
+function startMock(){ robot={x:-1.0,y:-0.7,yaw:0.3,valid:true}; path=[]; target=null;
+  clearInterval(mockT); mockT=setInterval(mockStep,1000/30); }
+function stopMock(){ clearInterval(mockT); mockT=null; }
+function mockGo(g){ target={...g};
+  path=[[robot.x,robot.y],[(robot.x+g.x)/2,(robot.y+g.y)/2+0.25],[g.x,g.y]]; }  // gentle plan
+function mockStep(){ lastMsg=performance.now();
+  if(target){ const dx=target.x-robot.x, dy=target.y-robot.y, d=Math.hypot(dx,dy);
+    if(d<0.03){ target=null; path=[]; }
+    else { const v=Math.min(0.02, d); robot.x+=dx/d*v; robot.y+=dy/d*v; robot.yaw=Math.atan2(dy,dx); } }
+}
+startMock();
+</script>
+</body>
+</html>
